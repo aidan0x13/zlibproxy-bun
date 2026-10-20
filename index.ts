@@ -20,6 +20,7 @@ let context: BrowserContext | null = null;
 let browserInitPromise: Promise<BrowserContext> | null = null;
 let browserPage: Page | null = null;
 let browserPageQueue: Promise<void> = Promise.resolve();
+let browserRequestHeaders: Record<string, string> = {};
 const routedBrowserPages = new WeakSet<Page>();
 const DOWNLOAD_CONTROL_MARKER_ATTRIBUTE = "data-zlibproxy-download-target";
 
@@ -52,12 +53,6 @@ const SKIP_HEADERS = [
   "sec-fetch-user",
 ];
 
-const CLOUDFLARE_CHALLENGE_HEADER_OVERRIDES = [
-  "origin",
-  "referer",
-  "upgrade-insecure-requests",
-];
-
 function logIncomingHeaders(req: Request, targetUrl: string): void {
   console.log(`\n--- Incoming Request Headers for ${targetUrl} ---`);
   req.headers.forEach((value, key) => {
@@ -86,46 +81,37 @@ function getBrowserHeaders(req: Request): Record<string, string> {
   const headers: Record<string, string> = {};
   const acceptLanguage = req.headers.get("accept-language");
 
-  headers["Referer"] = TARGET_DOMAIN + "/";
-  headers["Origin"] = TARGET_DOMAIN;
+  headers["referer"] = TARGET_DOMAIN + "/";
+  headers["origin"] = TARGET_DOMAIN;
 
   if (acceptLanguage) {
-    headers["Accept-Language"] = acceptLanguage;
+    headers["accept-language"] = acceptLanguage;
   }
 
   return headers;
 }
 
-function isCloudflareChallengeUrl(requestUrl: string): boolean {
-  const parsedUrl = new URL(requestUrl);
-
+function shouldInjectBrowserHeaders(requestUrl: URL): boolean {
   return (
-    parsedUrl.hostname === "challenges.cloudflare.com" ||
-    parsedUrl.pathname.startsWith("/cdn-cgi/challenge-platform/")
+    requestUrl.hostname === TARGET_HOSTNAME &&
+    !requestUrl.pathname.startsWith("/cdn-cgi/")
   );
 }
 
 async function prepareBrowserPage(page: Page, req: Request): Promise<void> {
+  browserRequestHeaders = getBrowserHeaders(req);
+
+  // Page-wide setExtraHTTPHeaders leaks Origin/Referer into Turnstile and makes
+  // verification fail, so only inject them on Z-Library's own requests.
   if (!routedBrowserPages.has(page)) {
     routedBrowserPages.add(page);
 
-    await page.route(
-      (requestUrl) => isCloudflareChallengeUrl(requestUrl.href),
-      async (route) => {
-        const headers = { ...route.request().headers() };
-
-        for (const header of CLOUDFLARE_CHALLENGE_HEADER_OVERRIDES) {
-          delete headers[header];
-        }
-
-        await route.continue({ headers });
-      },
-    );
+    await page.route(shouldInjectBrowserHeaders, async (route) => {
+      await route.continue({
+        headers: { ...route.request().headers(), ...browserRequestHeaders },
+      });
+    });
   }
-
-  // Z-Library expects these browser headers. Cloudflare challenge requests strip
-  // them above so Turnstile doesn't receive a forced cross-origin Origin/Referer.
-  await page.setExtraHTTPHeaders(getBrowserHeaders(req));
 }
 
 async function getBrowserPage(ctx: BrowserContext): Promise<Page> {
@@ -314,6 +300,7 @@ async function isCloudflareChallengeActive(
     lowerTitle.includes("just a moment") ||
     lowerTitle.includes("checking") ||
     lowerTitle.includes("security verification") ||
+    lowerTitle.includes("suspected phishing") ||
     lowerTitle.startsWith("loading http")
   ) {
     return true;
@@ -332,6 +319,25 @@ async function isCloudflareChallengeActive(
   } catch {
     return true;
   }
+}
+
+// Cloudflare's "Suspected Phishing" interstitial enables its bypass button once
+// the embedded Turnstile passes.
+async function clickPhishingBypass(page: Page): Promise<void> {
+  const button = page.locator("#bypass-button");
+
+  if ((await button.count()) === 0 || !(await button.isEnabled())) {
+    return;
+  }
+
+  console.log("  -> Clicking 'Ignore & Proceed' on Cloudflare phishing warning");
+  await randomDelay(300, 900);
+  await Promise.all([
+    page
+      .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 })
+      .catch(() => {}),
+    button.click(),
+  ]);
 }
 
 function shouldRestoreRequestedUrl(currentUrl: string, requestedUrl: string): boolean {
@@ -383,6 +389,8 @@ async function waitForBrowserCheck(
     } catch {
       // Context was destroyed due to navigation, wait a bit and retry
     }
+
+    await clickPhishingBypass(page).catch(() => {});
 
     // If the verification checkbox is shown, click it.
     await clickTurnstileCheckbox(page).catch(() => {});
